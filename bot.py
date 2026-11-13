@@ -100,10 +100,29 @@ def extract_url_from_message(message: types.Message | None) -> str | None:
     return None
 
 
+# --- ОТПРАВКА ПАЧКИ ФОТО/ВИДЕО (С ПОДДЕРЖКОЙ ОДИНОЧНЫХ ФАЙЛОВ И АЛЬБОМОВ) ---
+async def send_visual_chunk(message: types.Message, chunk: list, total_count: int, is_first_batch: bool):
+    if len(chunk) == 1:
+        m_type, m_path = chunk[0]
+        if m_type == "photo":
+            await message.answer_photo(FSInputFile(m_path), caption="📸 Фото из поста")
+        else:
+            await message.answer_video(FSInputFile(m_path), caption="🎬 Видео из поста", supports_streaming=True)
+    else:
+        media_group = []
+        for idx, (m_type, m_path) in enumerate(chunk):
+            cap = f"📸 Карусель ({total_count} медиа)" if idx == 0 and is_first_batch else None
+            if m_type == "photo":
+                media_group.append(InputMediaPhoto(media=FSInputFile(m_path), caption=cap))
+            else:
+                media_group.append(InputMediaVideo(media=FSInputFile(m_path), caption=cap, supports_streaming=True))
+        await message.answer_media_group(media_group)
+
+
 # --- ФИЛЬТР ЗАЩИТЫ ОТ ПРЯМЫХ ЭФИРОВ ---
 def _no_live_filter(info, *, incomplete):
-    if info.get('is_live'):
-        return "Прямые эфиры (стримы) не поддерживаются"
+    if info.get('is_live') or info.get('live_status') == 'is_live':
+        raise yt_dlp.utils.DownloadError("LIVE_STREAM_NOT_SUPPORTED")
     return None
 
 
@@ -246,8 +265,9 @@ def download_media(url: str, base_filename: str, mode: str) -> dict:
         ydl_opts = {
             **common_opts,
             'format': (
-                'bestvideo[vcodec^=avc1][filesize<?42M]+bestaudio[ext=m4a]/'
-                'bestvideo[ext=mp4][filesize<?42M]+bestaudio[ext=m4a]/'
+                'bestvideo[vcodec^=avc1][filesize<?42M]+bestaudio[acodec^=mp4a][filesize<?10M]/'
+                'bestvideo[vcodec^=avc1][filesize<?42M]+bestaudio[filesize<?10M]/'
+                'bestvideo[ext=mp4][filesize<?42M]+bestaudio[filesize<?10M]/'
                 'best[ext=mp4][filesize<?49M]/'
                 'best[filesize<?49M]/best'
             ),
@@ -263,7 +283,6 @@ def download_media(url: str, base_filename: str, mode: str) -> dict:
         if 'entries' in info and info['entries']:
             info = info['entries'][0]
 
-        # Если искали видео, а соцсеть отдала только звук (слайд-шоу), переключаемся на карусель
         if mode == "video" and info.get('vcodec') == 'none':
             raise ValueError("Пост не содержит видеопотока (слайд-шоу).")
 
@@ -379,6 +398,9 @@ async def process_inline_download(chosen_result: ChosenInlineResult):
                     uploader = result["uploader"]
                     width, height, duration = result["width"], result["height"], result["duration"]
             except Exception as e:
+                if "LIVE_STREAM_NOT_SUPPORTED" in str(e):
+                    await bot.edit_message_text(inline_message_id=inline_msg_id, text="⚠️ Прямые эфиры (стримы) не поддерживаются.")
+                    return
                 logging.info(f"Inline yt-dlp fallback triggered: {e}")
 
         if not final_path and "tiktok.com" in url:
@@ -518,11 +540,18 @@ async def handle_link(message: types.Message):
         ]
     ])
 
-    await message.reply(
-        "✨ <b>Ссылка найдена!</b> Что скачиваем?",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
+    try:
+        await message.reply(
+            "✨ <b>Ссылка найдена!</b> Что скачиваем?",
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    except Exception:
+        await message.answer(
+            "✨ <b>Ссылка найдена!</b> Что скачиваем?",
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
 
 
 @dp.callback_query(F.data.startswith("dl:"))
@@ -534,7 +563,6 @@ async def process_download(callback: CallbackQuery):
     _, mode, link_id = callback.data.split(":")
     raw_url = url_storage.get(link_id)
 
-    # Если сервер перезапускался и память очистилась — достаем ссылку напрямую из исходного сообщения
     if not raw_url and callback.message.reply_to_message:
         raw_url = extract_url_from_message(callback.message.reply_to_message)
 
@@ -596,6 +624,9 @@ async def process_download(callback: CallbackQuery):
                     await safe_delete(callback.message)
                     return
             except Exception as e:
+                if "LIVE_STREAM_NOT_SUPPORTED" in str(e):
+                    await safe_edit(callback.message, "⚠️ Прямые эфиры (стримы) не поддерживаются.")
+                    return
                 logging.info(f"Video yt-dlp fallback triggered: {e}")
 
         # 2. СКАЧИВАЕМ АУДИО ЧЕРЕЗ YT-DLP
@@ -620,6 +651,9 @@ async def process_download(callback: CallbackQuery):
                     await safe_delete(callback.message)
                     return
             except Exception as e:
+                if "LIVE_STREAM_NOT_SUPPORTED" in str(e):
+                    await safe_edit(callback.message, "⚠️ Прямые эфиры (стримы) не поддерживаются.")
+                    return
                 logging.info(f"Audio yt-dlp fallback triggered: {e}")
 
         # 3. КАРУСЕЛИ И РЕЗЕРВНЫЙ КАНАЛ (TIKTOK API / GALLERY-DL)
@@ -648,7 +682,7 @@ async def process_download(callback: CallbackQuery):
                 all_visual_media.append(("video", vid))
 
         if not all_visual_media:
-            await safe_edit(callback.message, "❌ Не удалось найти доступные медиа по этой ссылке (возможно, аккаунт закрыт или идет прямой эфир).")
+            await safe_edit(callback.message, "❌ Не удалось найти доступные медиа по этой ссылке (возможно, аккаунт закрыт).")
             return
 
         await safe_edit(callback.message, f"📤 Отправляю файлы ({len(all_visual_media)} шт.)...")
@@ -656,28 +690,13 @@ async def process_download(callback: CallbackQuery):
         async with ChatActionSender.upload_photo(bot=bot, chat_id=callback.message.chat.id):
             for i in range(0, len(all_visual_media), 10):
                 if i > 0:
-                    await asyncio.sleep(1.5)  # Пауза между пачками по 10 фото, чтобы не словить FloodWait от Telegram
+                    await asyncio.sleep(1.5)
                 chunk = all_visual_media[i:i + 10]
                 try:
-                    if len(chunk) == 1:
-                        m_type, m_path = chunk[0]
-                        if m_type == "photo":
-                            await callback.message.answer_photo(FSInputFile(m_path), caption="📸 Фото из поста")
-                        else:
-                            await callback.message.answer_video(FSInputFile(m_path), caption="🎬 Видео из поста", supports_streaming=True)
-                    else:
-                        media_group = []
-                        for idx, (m_type, m_path) in enumerate(chunk):
-                            cap = f"📸 Карусель ({len(all_visual_media)} медиа)" if idx == 0 and i == 0 else None
-                            if m_type == "photo":
-                                media_group.append(InputMediaPhoto(media=FSInputFile(m_path), caption=cap))
-                            else:
-                                media_group.append(InputMediaVideo(media=FSInputFile(m_path), caption=cap, supports_streaming=True))
-                        await callback.message.answer_media_group(media_group)
+                    await send_visual_chunk(callback.message, chunk, len(all_visual_media), is_first_batch=(i == 0))
                 except TelegramRetryAfter as e:
                     await asyncio.sleep(e.retry_after + 1)
-                    if len(chunk) > 1:
-                        await callback.message.answer_media_group(media_group)
+                    await send_visual_chunk(callback.message, chunk, len(all_visual_media), is_first_batch=(i == 0))
 
         if audios and images:
             async with ChatActionSender.upload_voice(bot=bot, chat_id=callback.message.chat.id):
