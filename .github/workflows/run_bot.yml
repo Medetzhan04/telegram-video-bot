@@ -1,14 +1,14 @@
 name: Run Telegram Bot 24/7
 
 on:
-  workflow_dispatch: # Позволяет включить бота кнопкой вручную
+  workflow_dispatch: # Ручной запуск кнопкой
   schedule:
-    - cron: '*/30 * * * *' # Проверяет каждые 30 минут, что бот работает
+    - cron: '*/30 * * * *' # Запасной будильник на случай сбоев
 
-# Гарантирует, что не запустится 2 копии бота одновременно
-concurrency:
-  group: telegram-bot-runner
-  cancel-in-progress: false
+# Разрешаем роботу перезапускать самого себя!
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   run-bot:
@@ -24,15 +24,22 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Устанавливаем FFmpeg и свежий yt-dlp с маскировкой
+      - name: Устанавливаем FFmpeg и свежий yt-dlp
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
           pip install -U -r requirements.txt
           pip install -U --pre "yt-dlp[default,curl-cffi]"
 
-      - name: Запускаем бота (цикл 5.5 часов с автоперезапуском)
+      - name: Запускаем бота (на 5 часов 20 минут)
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
-          timeout 20000s python bot.py || true
+          timeout 19200s python bot.py || true
+
+      - name: Передаем эстафету (Автоматический перезапуск)
+        if: always() && github.event_name != 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run run_bot.yml --ref ${{ github.ref_name }}
