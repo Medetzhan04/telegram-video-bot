@@ -4,15 +4,20 @@ import uuid
 import shutil
 import asyncio
 import subprocess
-import urllib.request
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import (
     FSInputFile,
     InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaAudio,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    CallbackQuery
+    CallbackQuery,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
+    ChosenInlineResult
 )
 from aiogram.utils.chat_action import ChatActionSender
 import yt_dlp
@@ -27,7 +32,7 @@ url_storage = {}
 
 # --- ВЕБ-СЕРВЕР ---
 async def health_check(request):
-    return web.Response(text="Bot v2.0 (Carousel Ready) is running 24/7!")
+    return web.Response(text="Bot v3.0 (Inline + Carousel) is running 24/7!")
 
 async def start_web_server():
     app = web.Application()
@@ -41,13 +46,14 @@ async def start_web_server():
 # --- КОМАНДА /start ---
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
+    bot_info = await bot.get_me()
     await message.answer(
-        "🚀 <b>Привет! Я твой универсальный загрузчик медиа (v2.0).</b>\n\n"
-        "Поддерживаю <b>1000+ сайтов</b>:\n"
-        "• <b>TikTok</b> (Видео + Фото-карусели + Музыка)\n"
-        "• <b>Instagram</b> (Reels, Посты, Карусели)\n"
-        "• <b>YouTube, VK, Pinterest, X (Twitter), Reddit</b>\n\n"
-        "Кидай любую ссылку! 👇",
+        "🚀 <b>Привет! Я твой универсальный загрузчик медиа (v3.0).</b>\n\n"
+        "📥 <b>Как пользоваться в личке:</b>\n"
+        "Просто отправь мне ссылку из TikTok, Instagram, YouTube, VK или Pinterest.\n\n"
+        "⚡ <b>Как пользоваться в ЛЮБОМ другом чате (Inline-режим):</b>\n"
+        f"Напиши в любом диалоге с другом:\n<code>@{bot_info.username} ссылка_на_ролик</code>\n"
+        "и нажми на всплывающую кнопку!",
         parse_mode="HTML"
     )
 
@@ -67,7 +73,6 @@ async def download_tiktok_carousel(url: str, folder_name: str) -> dict:
                 title = post_data.get("title") or title
                 img_urls = post_data.get("images", [])
 
-                # Скачиваем все слайды карусели
                 for idx, img_url in enumerate(img_urls):
                     img_path = os.path.join(folder_name, f"slide_{idx:03d}.jpg")
                     async with session.get(img_url) as img_resp:
@@ -76,7 +81,6 @@ async def download_tiktok_carousel(url: str, folder_name: str) -> dict:
                                 f.write(await img_resp.read())
                             images.append(img_path)
 
-                # Скачиваем фоновую музыку из карусели
                 music_url = post_data.get("music")
                 if music_url:
                     audio_path = os.path.join(folder_name, "audio.mp3")
@@ -88,7 +92,7 @@ async def download_tiktok_carousel(url: str, folder_name: str) -> dict:
 
     return {"images": images, "audios": audios, "title": title}
 
-# --- СКАЧИВАНИЕ КАРУСЕЛЕЙ ИЗ ДРУГИХ СОЦСЕТЕЙ (GALLERY-DL) ---
+# --- СКАЧИВАНИЕ КАРУСЕЛЕЙ ИЗ ДРУГИХ СОЦСЕТЕЙ ---
 def download_other_carousel(url: str, folder_name: str) -> dict:
     os.makedirs(folder_name, exist_ok=True)
     cmd = [
@@ -114,7 +118,6 @@ def download_other_carousel(url: str, folder_name: str) -> dict:
 
 # --- СКАЧИВАНИЕ ВИДЕО И АУДИО (YT-DLP) ---
 def download_media(url: str, base_filename: str, mode: str) -> dict:
-    # Если в ссылке TikTok написано /photo/, меняем на /video/ для совместимости с yt-dlp
     clean_url = url.replace("/photo/", "/video/") if "tiktok.com" in url else url
 
     common_opts = {
@@ -160,7 +163,157 @@ def download_media(url: str, base_filename: str, mode: str) -> dict:
 
         return {"file": final_file, "title": title, "uploader": uploader}
 
-# --- ЛОВИМ ССЫЛКУ ---
+# ==========================================
+# 🔥 INLINE MODE (ВЫЗОВ ЧЕРЕЗ @БОТ В ЧАТАХ)
+# ==========================================
+@dp.inline_query()
+async def inline_link_handler(inline_query: InlineQuery):
+    query_text = inline_query.query.strip()
+    match = re.search(r'(https?://[^\s]+)', query_text)
+
+    if not match:
+        await inline_query.answer(
+            results=[],
+            switch_pm_text="Вставь ссылку после @имени_бота...",
+            switch_pm_parameter="inline_help",
+            cache_time=1
+        )
+        return
+
+    url = match.group(1)
+    link_id = str(uuid.uuid4())[:8]
+    url_storage[link_id] = url
+
+    # Кнопка-пустышка (обязательна, чтобы Telegram выдал inline_message_id для замены на видео)
+    wait_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏳ Скачиваю и прикрепляю...", callback_data="noop")]
+    ])
+
+    results = [
+        InlineQueryResultArticle(
+            id=f"video:{link_id}",
+            title="🎬 Отправить Видео сюда",
+            description=f"Скачать и вставить ролик: {url[:40]}...",
+            input_message_content=InputTextMessageContent(
+                message_text="⏳ <b>Загружаю видео по ссылке...</b>\n<i>Подождите пару секунд, сообщение обновится автоматически!</i>",
+                parse_mode="HTML"
+            ),
+            reply_markup=wait_kb
+        ),
+        InlineQueryResultArticle(
+            id=f"audio:{link_id}",
+            title="🎵 Отправить только Звук (MP3)",
+            description=f"Вырезать аудио из: {url[:40]}...",
+            input_message_content=InputTextMessageContent(
+                message_text="🎵 <b>Вырезаю аудиодорожку (MP3)...</b>\n<i>Подождите пару секунд!</i>",
+                parse_mode="HTML"
+            ),
+            reply_markup=wait_kb
+        )
+    ]
+
+    await inline_query.answer(results, cache_time=1, is_personal=True)
+
+@dp.chosen_inline_result()
+async def process_inline_download(chosen_result: ChosenInlineResult):
+    if not chosen_result.inline_message_id:
+        return
+
+    mode, link_id = chosen_result.result_id.split(":")
+    url = url_storage.get(link_id)
+    user_id = chosen_result.from_user.id
+    inline_msg_id = chosen_result.inline_message_id
+
+    if not url:
+        await bot.edit_message_text(
+            inline_message_id=inline_msg_id,
+            text="⚠️ Ссылка устарела, попробуй ещё раз."
+        )
+        return
+
+    base_filename = f"inline_{user_id}_{link_id}"
+
+    try:
+        result = await asyncio.to_thread(download_media, url, base_filename, mode)
+        final_path = result["file"]
+        title = result["title"][:100]
+        uploader = result["uploader"]
+
+        if not os.path.exists(final_path):
+            await bot.edit_message_text(
+                inline_message_id=inline_msg_id,
+                text=f"❌ Не удалось скачать видео (<a href='{url}'>ссылка</a>).",
+                parse_mode="HTML"
+            )
+            return
+
+        # Загружаем файл через личку с пользователем, чтобы получить file_id от Telegram
+        if mode == "audio":
+            sent = await bot.send_audio(
+                chat_id=user_id,
+                audio=FSInputFile(final_path),
+                title=title,
+                performer=uploader or "Audio",
+                disable_notification=True
+            )
+            file_id = sent.audio.file_id
+            await sent.delete() # Сразу удаляем техническое сообщение из лички
+
+            await bot.edit_message_media(
+                inline_message_id=inline_msg_id,
+                media=InputMediaAudio(
+                    media=file_id,
+                    caption=f"🎵 <b>{title}</b>",
+                    parse_mode="HTML"
+                )
+            )
+        else:
+            sent = await bot.send_video(
+                chat_id=user_id,
+                video=FSInputFile(final_path),
+                disable_notification=True
+            )
+            file_id = sent.video.file_id
+            await sent.delete() # Сразу удаляем техническое сообщение из лички
+
+            caption = f"🎬 <b>{title}</b>"
+            if uploader:
+                caption += f"\n👤 Автор: {uploader}"
+
+            await bot.edit_message_media(
+                inline_message_id=inline_msg_id,
+                media=InputMediaVideo(
+                    media=file_id,
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+            )
+
+    except Exception as e:
+        await bot.edit_message_text(
+            inline_message_id=inline_msg_id,
+            text=(
+                f"❌ <b>Не удалось загрузить в инлайн-режиме.</b>\n"
+                f"💡 <i>Важно: чтобы инлайн-режим работал, нужно хотя бы раз нажать /start в личке у бота!</i>\n"
+                f"Ссылка: {url}"
+            ),
+            parse_mode="HTML"
+        )
+    finally:
+        for f in os.listdir('.'):
+            if f.startswith(base_filename):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+
+@dp.callback_query(F.data == "noop")
+async def noop_cb(callback: CallbackQuery):
+    await callback.answer("⏳ Видео уже качается, подожди пару секунд!", show_alert=False)
+
+# ==========================================
+# ОБЫЧНЫЙ РЕЖИМ В ЛИЧКЕ (ВИДЕО + КАРУСЕЛИ)
+# ==========================================
 @dp.message(F.text)
 async def handle_link(message: types.Message):
     match = re.search(r'(https?://[^\s]+)', message.text)
@@ -188,7 +341,6 @@ async def handle_link(message: types.Message):
         parse_mode="HTML"
     )
 
-# --- ОБРАБОТКА НАЖАТИЯ КНОПКИ ---
 @dp.callback_query(F.data.startswith("dl:"))
 async def process_download(callback: CallbackQuery):
     _, mode, link_id = callback.data.split(":")
@@ -208,7 +360,6 @@ async def process_download(callback: CallbackQuery):
     try:
         is_tiktok_photo = "tiktok.com" in url and "/photo/" in url
 
-        # 1. Пробуем скачать как обычное видео (если это не явный фото-пост TikTok)
         if mode == "video" and not is_tiktok_photo:
             try:
                 result = await asyncio.to_thread(download_media, url, base_filename, mode)
@@ -217,7 +368,7 @@ async def process_download(callback: CallbackQuery):
                 if os.path.exists(final_path) and not final_path.endswith(('.mp3', '.m4a')):
                     file_size_mb = os.path.getsize(final_path) / (1024 * 1024)
                     if file_size_mb > 49.5:
-                        await callback.message.edit_text(f"⚠️ Файл слишком большой ({file_size_mb:.1f} МБ). Лимит Telegram — 50 МБ.")
+                        await callback.message.edit_text(f"⚠️ Файл слишком большой ({file_size_mb:.1f} МБ). Лимит — 50 МБ.")
                         return
 
                     await callback.message.edit_text("📤 Отправляю видео в чат...")
@@ -237,7 +388,6 @@ async def process_download(callback: CallbackQuery):
             except Exception:
                 pass
 
-        # 2. Пробуем скачать только звук через yt-dlp
         if mode == "audio" and not is_tiktok_photo:
             try:
                 result = await asyncio.to_thread(download_media, url, base_filename, "audio")
@@ -256,7 +406,6 @@ async def process_download(callback: CallbackQuery):
             except Exception:
                 pass
 
-        # 3. Качаем как ФОТО-КАРУСЕЛЬ (TikTok или другие соцсети)
         await callback.message.edit_text("📸 Скачиваю слайды из фото-карусели...")
         if "tiktok.com" in url:
             carousel_data = await download_tiktok_carousel(url, carousel_folder)
@@ -278,7 +427,6 @@ async def process_download(callback: CallbackQuery):
 
         await callback.message.edit_text(f"📤 Отправляю фото ({len(images)} шт.)...")
 
-        # Отправляем альбомами по 10 фотографий
         async with ChatActionSender.upload_photo(bot=bot, chat_id=callback.message.chat.id):
             for i in range(0, len(images), 10):
                 chunk = images[i:i + 10]
@@ -294,7 +442,6 @@ async def process_download(callback: CallbackQuery):
                     ]
                     await callback.message.answer_media_group(media_group)
 
-        # Отправляем фоновый трек из карусели
         if audios:
             async with ChatActionSender.upload_voice(bot=bot, chat_id=callback.message.chat.id):
                 await callback.message.answer_audio(
@@ -306,7 +453,7 @@ async def process_download(callback: CallbackQuery):
 
     except Exception as e:
         await callback.message.edit_text(
-            f"❌ <b>Ошибка при обработке (v2.0):</b>\n<code>{str(e)[:200]}</code>",
+            f"❌ <b>Ошибка при обработке (v3.0):</b>\n<code>{str(e)[:200]}</code>",
             parse_mode="HTML"
         )
     finally:
