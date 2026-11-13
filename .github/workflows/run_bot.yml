@@ -1,22 +1,25 @@
 name: Run Telegram Bot 24/7
 
 on:
-  workflow_dispatch: # Ручной запуск кнопкой
+  workflow_dispatch:
   schedule:
-    - cron: '*/30 * * * *' # Запасной будильник на случай сбоев
+    - cron: '0 */4 * * *'
 
-# Разрешаем роботу перезапускать самого себя!
 permissions:
   actions: write
   contents: read
 
+concurrency:
+  group: telegram-bot-production
+  cancel-in-progress: false
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 350
 
     steps:
-      - name: Скачиваем файлы бота
+      - name: Скачиваем файлы репозитория
         uses: actions/checkout@v4
 
       - name: Устанавливаем Python 3.11
@@ -24,22 +27,22 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Устанавливаем FFmpeg и свежий yt-dlp
+      - name: Устанавливаем FFmpeg и свежие библиотеки
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
           pip install -U -r requirements.txt
           pip install -U --pre "yt-dlp[default,curl-cffi]"
 
-      - name: Запускаем бота (на 5 часов 20 минут)
+      - name: Запускаем бота (цикл 5 часов 15 минут)
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
-          timeout 19200s python bot.py || true
+          timeout 18900s python bot.py || true
 
-      - name: Передаем эстафету (Автоматический перезапуск)
-        if: always() && github.event_name != 'schedule'
+      - name: Автоматический перезапуск следующего цикла
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh workflow run run_bot.yml --ref ${{ github.ref_name }}
+          gh workflow run run_bot.yml --ref ${{ github.ref_name }} || true
