@@ -4,17 +4,19 @@ import uuid
 import shutil
 import asyncio
 import subprocess
+import urllib.request
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import (
     FSInputFile,
-     InputMediaPhoto,
+    InputMediaPhoto,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery
 )
 from aiogram.utils.chat_action import ChatActionSender
 import yt_dlp
+import aiohttp
 from aiohttp import web
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -25,7 +27,7 @@ url_storage = {}
 
 # --- ВЕБ-СЕРВЕР ---
 async def health_check(request):
-    return web.Response(text="Bot is alive and running 24/7!")
+    return web.Response(text="Bot v2.0 (Carousel Ready) is running 24/7!")
 
 async def start_web_server():
     app = web.Application()
@@ -40,7 +42,7 @@ async def start_web_server():
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
     await message.answer(
-        "🚀 <b>Привет! Я твой универсальный загрузчик медиа.</b>\n\n"
+        "🚀 <b>Привет! Я твой универсальный загрузчик медиа (v2.0).</b>\n\n"
         "Поддерживаю <b>1000+ сайтов</b>:\n"
         "• <b>TikTok</b> (Видео + Фото-карусели + Музыка)\n"
         "• <b>Instagram</b> (Reels, Посты, Карусели)\n"
@@ -49,10 +51,46 @@ async def start_cmd(message: types.Message):
         parse_mode="HTML"
     )
 
-# --- СКАЧИВАНИЕ ФОТО-КАРУСЕЛЕЙ (ЧЕРЕЗ GALLERY-DL) ---
-def download_carousel(url: str, folder_name: str) -> dict:
+# --- ПРЯМОЕ СКАЧИВАНИЕ ФОТО-КАРУСЕЛЕЙ TIKTOK ---
+async def download_tiktok_carousel(url: str, folder_name: str) -> dict:
     os.makedirs(folder_name, exist_ok=True)
-    # Вызываем gallery-dl для скачивания всех картинок и звука из поста
+    images = []
+    audios = []
+    title = "TikTok Фото-карусель"
+
+    api_url = "https://www.tikwm.com/api/"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(api_url, data={"url": url, "hd": 1}) as resp:
+            data = await resp.json()
+            if data.get("code") == 0 and "data" in data:
+                post_data = data["data"]
+                title = post_data.get("title") or title
+                img_urls = post_data.get("images", [])
+
+                # Скачиваем все слайды карусели
+                for idx, img_url in enumerate(img_urls):
+                    img_path = os.path.join(folder_name, f"slide_{idx:03d}.jpg")
+                    async with session.get(img_url) as img_resp:
+                        if img_resp.status == 200:
+                            with open(img_path, "wb") as f:
+                                f.write(await img_resp.read())
+                            images.append(img_path)
+
+                # Скачиваем фоновую музыку из карусели
+                music_url = post_data.get("music")
+                if music_url:
+                    audio_path = os.path.join(folder_name, "audio.mp3")
+                    async with session.get(music_url) as aud_resp:
+                        if aud_resp.status == 200:
+                            with open(audio_path, "wb") as f:
+                                f.write(await aud_resp.read())
+                            audios.append(audio_path)
+
+    return {"images": images, "audios": audios, "title": title}
+
+# --- СКАЧИВАНИЕ КАРУСЕЛЕЙ ИЗ ДРУГИХ СОЦСЕТЕЙ (GALLERY-DL) ---
+def download_other_carousel(url: str, folder_name: str) -> dict:
+    os.makedirs(folder_name, exist_ok=True)
     cmd = [
         "gallery-dl",
         "--directory", folder_name,
@@ -63,8 +101,6 @@ def download_carousel(url: str, folder_name: str) -> dict:
 
     images = []
     audios = []
-    videos = []
-
     for root, _, files in os.walk(folder_name):
         for f in sorted(files):
             full_path = os.path.join(root, f)
@@ -73,13 +109,14 @@ def download_carousel(url: str, folder_name: str) -> dict:
                 images.append(full_path)
             elif ext in ('mp3', 'm4a', 'wav', 'ogg'):
                 audios.append(full_path)
-            elif ext in ('mp4', 'webm', 'mov'):
-                videos.append(full_path)
 
-    return {"images": images, "audios": audios, "videos": videos}
+    return {"images": images, "audios": audios}
 
-# --- СКАЧИВАНИЕ ВИДЕО И АУДИО (ЧЕРЕЗ YT-DLP) ---
+# --- СКАЧИВАНИЕ ВИДЕО И АУДИО (YT-DLP) ---
 def download_media(url: str, base_filename: str, mode: str) -> dict:
+    # Если в ссылке TikTok написано /photo/, меняем на /video/ для совместимости с yt-dlp
+    clean_url = url.replace("/photo/", "/video/") if "tiktok.com" in url else url
+
     common_opts = {
         'quiet': True,
         'noplaylist': True,
@@ -110,7 +147,7 @@ def download_media(url: str, base_filename: str, mode: str) -> dict:
         }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+        info = ydl.extract_info(clean_url, download=True)
         title = info.get('title', 'Медиафайл')
         uploader = info.get('uploader', '')
 
@@ -128,7 +165,7 @@ def download_media(url: str, base_filename: str, mode: str) -> dict:
 async def handle_link(message: types.Message):
     match = re.search(r'(https?://[^\s]+)', message.text)
     if not match:
-        await message.answer("🔗 Отправь мне ссылку на ролик или пост (начинается с http:// или https://)")
+        await message.answer("🔗 Отправь мне ссылку на ролик или фото-пост (начинается с http:// или https://)")
         return
 
     url = match.group(1)
@@ -162,22 +199,21 @@ async def process_download(callback: CallbackQuery):
         return
 
     await callback.answer()
-    action_text = "🎵 Вырезаю аудио (MP3)..." if mode == "audio" else "⏳ Загружаю медиа (видео или фото-карусель)..."
+    action_text = "🎵 Вырезаю аудио (MP3)..." if mode == "audio" else "⏳ Загружаю медиа..."
     await callback.message.edit_text(action_text)
 
     base_filename = f"media_{callback.from_user.id}_{link_id}"
     carousel_folder = f"carousel_{callback.from_user.id}_{link_id}"
 
     try:
-        # Если ссылка явно ведет на фото-пост TikTok (/photo/) или yt-dlp не справился — качаем карусель
-        is_tiktok_photo = "/photo/" in url
+        is_tiktok_photo = "tiktok.com" in url and "/photo/" in url
 
+        # 1. Пробуем скачать как обычное видео (если это не явный фото-пост TikTok)
         if mode == "video" and not is_tiktok_photo:
             try:
                 result = await asyncio.to_thread(download_media, url, base_filename, mode)
                 final_path = result["file"]
 
-                # Если yt-dlp скачал только аудио (так бывает на слайд-шоу TikTok), переключаемся на карусель
                 if os.path.exists(final_path) and not final_path.endswith(('.mp3', '.m4a')):
                     file_size_mb = os.path.getsize(final_path) / (1024 * 1024)
                     if file_size_mb > 49.5:
@@ -199,11 +235,10 @@ async def process_download(callback: CallbackQuery):
                     await callback.message.delete()
                     return
             except Exception:
-                # Если yt-dlp выдал ошибку на видео, пробуем вытащить как фото-карусель!
                 pass
 
-        # Режим только аудио (MP3)
-        if mode == "audio":
+        # 2. Пробуем скачать только звук через yt-dlp
+        if mode == "audio" and not is_tiktok_photo:
             try:
                 result = await asyncio.to_thread(download_media, url, base_filename, "audio")
                 final_path = result["file"]
@@ -221,9 +256,13 @@ async def process_download(callback: CallbackQuery):
             except Exception:
                 pass
 
-        # --- ЗАПУСК ЗАГРУЗЧИКА КАРУСЕЛЕЙ (GALLERY-DL) ---
-        await callback.message.edit_text("📸 Обнаружена фото-карусель! Скачиваю слайды...")
-        carousel_data = await asyncio.to_thread(download_carousel, url, carousel_folder)
+        # 3. Качаем как ФОТО-КАРУСЕЛЬ (TikTok или другие соцсети)
+        await callback.message.edit_text("📸 Скачиваю слайды из фото-карусели...")
+        if "tiktok.com" in url:
+            carousel_data = await download_tiktok_carousel(url, carousel_folder)
+        else:
+            carousel_data = await asyncio.to_thread(download_other_carousel, url, carousel_folder)
+
         images = carousel_data["images"]
         audios = carousel_data["audios"]
 
@@ -234,12 +273,12 @@ async def process_download(callback: CallbackQuery):
             return
 
         if not images:
-            await callback.message.edit_text("❌ Не удалось найти ни видео, ни фото по этой ссылке (возможно, аккаунт закрыт).")
+            await callback.message.edit_text("❌ Не удалось найти ни видео, ни фото по этой ссылке.")
             return
 
         await callback.message.edit_text(f"📤 Отправляю фото ({len(images)} шт.)...")
 
-        # Telegram разрешает до 10 фото в одном альбоме, поэтому разбиваем по 10 штук
+        # Отправляем альбомами по 10 фотографий
         async with ChatActionSender.upload_photo(bot=bot, chat_id=callback.message.chat.id):
             for i in range(0, len(images), 10):
                 chunk = images[i:i + 10]
@@ -255,23 +294,22 @@ async def process_download(callback: CallbackQuery):
                     ]
                     await callback.message.answer_media_group(media_group)
 
-        # Если к карусели в TikTok была прикреплена музыка — отправляем её бонусом!
+        # Отправляем фоновый трек из карусели
         if audios:
             async with ChatActionSender.upload_voice(bot=bot, chat_id=callback.message.chat.id):
                 await callback.message.answer_audio(
                     FSInputFile(audios[0]),
-                    caption="🎵 Фоновый звук из этой карусели"
+                    caption="🎵 Фоновый трек из этой карусели"
                 )
 
         await callback.message.delete()
 
     except Exception as e:
         await callback.message.edit_text(
-            f"❌ <b>Ошибка при скачивании:</b>\n<code>{str(e)[:200]}</code>",
+            f"❌ <b>Ошибка при обработке (v2.0):</b>\n<code>{str(e)[:200]}</code>",
             parse_mode="HTML"
         )
     finally:
-        # Чистим за собой все временные файлы и папки
         for f in os.listdir('.'):
             if f.startswith(base_filename):
                 try:
